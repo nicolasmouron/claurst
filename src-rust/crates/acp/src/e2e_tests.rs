@@ -29,6 +29,8 @@ pub(crate) enum Step {
     Tool(&'static str, Value),
     /// Fail the request with a provider error.
     Fail(&'static str),
+    /// Wait for the gate to open, then answer with the inner step.
+    Gated(Arc<Notify>, Box<Step>),
 }
 
 /// Provider double that replays `Step`s and records every request.
@@ -97,7 +99,11 @@ impl claurst_api::LlmProvider for ScriptedProvider {
 
         self.requests.lock().push(request);
         self.started.notify_one();
-        let step = self.steps.lock().pop_front().unwrap_or(Step::Text("done"));
+        let mut step = self.steps.lock().pop_front().unwrap_or(Step::Text("done"));
+        if let Step::Gated(gate, inner) = step {
+            gate.notified().await;
+            step = *inner;
+        }
         let start = Ok(StreamEvent::MessageStart {
             id: uuid::Uuid::new_v4().to_string(),
             model: "scripted-model".to_string(),
@@ -105,6 +111,7 @@ impl claurst_api::LlmProvider for ScriptedProvider {
         });
         let events = match step {
             Step::Hang => return Ok(Box::pin(futures::stream::pending())),
+            Step::Gated(..) => unreachable!("gates are opened above"),
             Step::Fail(message) => {
                 return Err(ProviderError::AuthFailed {
                     provider: self.id.clone(),
@@ -955,4 +962,132 @@ async fn load_refuses_unknown_and_unsafe_session_ids() {
         .await;
     let error: acp::Error = serde_json::from_value(unsafe_id["error"].clone()).expect("unsafe id is an error");
     assert_eq!(error.code, acp::ErrorCode::InvalidParams);
+}
+
+/// Texts of the user messages in `request`.
+fn user_texts(request: &ProviderRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .filter(|m| m.role == claurst_core::types::Role::User)
+        .map(|m| m.get_all_text())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+async fn queue(client: &Client, session_id: &acp::SessionId, text: &str) -> Value {
+    let response = client
+        .call(
+            crate::extensions::QUEUE_MESSAGE,
+            json!({ "sessionId": session_id, "text": text }),
+        )
+        .await;
+    response["result"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_queued_during_a_turn_reaches_the_model_at_the_next_step() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("queue-step");
+    std::fs::write(cwd.join("a.txt"), "hello").unwrap();
+    let gate = Arc::new(Notify::new());
+    let provider = ScriptedProvider::new(vec![
+        Step::Gated(
+            gate.clone(),
+            Box::new(Step::Tool("Read", json!({ "file_path": cwd.join("a.txt") }))),
+        ),
+        Step::Text("read it, and noted the icon"),
+    ]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let init = client.initialize_with_extensions().await;
+    assert_eq!(init["result"]["agentCapabilities"]["_meta"]["claurst"]["queueMessages"], true);
+    let session_id = client.new_session(&cwd).await;
+
+    let turn = {
+        let client = client.clone();
+        let session_id = session_id.clone();
+        tokio::spawn(async move { client.prompt(&session_id, "read a.txt").await })
+    };
+    provider.wait_started().await;
+    let queued = queue(&client, &session_id, "also add an icon").await;
+    assert_eq!(queued["queued"], true, "{queued}");
+    gate.notify_one();
+
+    let response = turn.await.expect("prompt task");
+    assert_eq!(stop_reason(&response), acp::StopReason::EndTurn);
+    assert_eq!(response["result"]["_meta"]["claurst"]["undeliveredMessages"], json!([]));
+    let requests = provider.requests.lock();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(user_texts(&requests[1]).last().map(String::as_str), Some("also add an icon"));
+    let events = client.events.lock();
+    assert!(
+        events.iter().any(|e| e["event"]
+            == json!({ "type": "input_injected", "messages": ["also add an icon"] })),
+        "{events:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_queued_during_the_final_answer_keeps_the_turn_going() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("queue-final");
+    let gate = Arc::new(Notify::new());
+    let provider = ScriptedProvider::new(vec![
+        Step::Gated(gate.clone(), Box::new(Step::Text("first answer"))),
+        Step::Text("answer to the follow-up"),
+    ]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    client.initialize_with_extensions().await;
+    let session_id = client.new_session(&cwd).await;
+
+    let turn = {
+        let client = client.clone();
+        let session_id = session_id.clone();
+        tokio::spawn(async move { client.prompt(&session_id, "question").await })
+    };
+    provider.wait_started().await;
+    assert_eq!(queue(&client, &session_id, "follow-up").await["queued"], true);
+    gate.notify_one();
+
+    let response = turn.await.expect("prompt task");
+    assert_eq!(stop_reason(&response), acp::StopReason::EndTurn);
+    let requests = provider.requests.lock();
+    assert_eq!(requests.len(), 2, "the queued message is answered in the same turn");
+    assert_eq!(user_texts(&requests[1]), vec!["question", "follow-up"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_messages_can_be_taken_back_and_a_cancel_returns_the_rest() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("queue-cancel");
+    let provider = ScriptedProvider::new(vec![Step::Hang]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    client.initialize_with_extensions().await;
+    let session_id = client.new_session(&cwd).await;
+
+    // Nothing running: the client must send it as a prompt instead.
+    assert_eq!(queue(&client, &session_id, "too early").await, json!({ "queued": false }));
+
+    let turn = {
+        let client = client.clone();
+        let session_id = session_id.clone();
+        tokio::spawn(async move { client.prompt(&session_id, "work").await })
+    };
+    provider.wait_started().await;
+    let first = queue(&client, &session_id, "first").await;
+    queue(&client, &session_id, "second").await;
+    let removed = client
+        .call(
+            crate::extensions::UNQUEUE_MESSAGE,
+            json!({ "sessionId": session_id, "id": first["id"] }),
+        )
+        .await;
+    assert_eq!(removed["result"], json!({ "removed": true }));
+
+    client
+        .notify("session/cancel", acp::CancelNotification::new(session_id.clone()))
+        .await;
+    let response = turn.await.expect("prompt task");
+    assert_eq!(stop_reason(&response), acp::StopReason::Cancelled);
+    assert_eq!(response["result"]["_meta"]["claurst"]["undeliveredMessages"], json!(["second"]));
 }

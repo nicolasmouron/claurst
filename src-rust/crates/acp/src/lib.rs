@@ -18,6 +18,9 @@
 //! | `session/cancel`             | C → A (no resp) | Cancel an in-flight prompt             |
 //! | `session/update`             | A → C (no resp) | Streamed text/tool deltas              |
 //! | `session/request_permission` | A → C      | Tool approval dialog                        |
+//! | `_claurst/queue_message`     | C → A      | Add input to the running prompt (extensions.rs) |
+//! | `_claurst/unqueue_message`   | C → A      | Take back input not delivered yet           |
+//! | `_claurst/session_event`     | A → C (no resp) | Opt-in loop events (extensions.rs)     |
 //!
 //! Per-session MCP server configs supplied via `session/new` are accepted
 //! but currently ignored in favour of the MCP servers configured in the

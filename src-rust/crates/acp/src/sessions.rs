@@ -8,6 +8,7 @@ use claurst_core::history::{CompactionRecord, ConversationSession};
 use claurst_core::permissions::PermissionManager;
 use claurst_core::session_journal::SessionJournal;
 use claurst_core::types::{Message, Role};
+use claurst_query::{CommandPriority, CommandQueue, QueuedCommand};
 use claurst_tools::PendingPermissionStore;
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
@@ -22,10 +23,11 @@ pub struct SessionState {
     /// Runtime built for `cwd`: settings, context, tools and MCP servers.
     pub runtime: Arc<AgentRuntime>,
     pub messages: parking_lot::Mutex<Vec<Message>>,
-    /// Cancellation token of the prompt currently running on this session,
-    /// `None` while the session is idle. Each prompt gets a fresh token, so a
-    /// `session/cancel` only ever affects the turn that was in flight.
-    active_turn: parking_lot::Mutex<Option<CancellationToken>>,
+    /// The prompt currently running on this session, `None` while the
+    /// session is idle. Each prompt gets a fresh cancel token and input queue,
+    /// so a `session/cancel` or a queued message only ever affects the turn
+    /// that was in flight.
+    active_turn: parking_lot::Mutex<Option<TurnSlot>>,
     pub pending_permissions: Arc<parking_lot::Mutex<PendingPermissionStore>>,
     /// Decides every tool check before anything is sent to the client, and
     /// holds this session's "Allow always" rules.
@@ -118,18 +120,36 @@ impl SessionState {
             return None;
         }
         let token = CancellationToken::new();
-        *slot = Some(token.clone());
+        let queue = CommandQueue::new();
+        *slot = Some(TurnSlot { token: token.clone(), queue: queue.clone() });
         Some(ActiveTurn {
             slot: &self.active_turn,
             token,
+            queue,
         })
+    }
+
+    /// Queue `text` for the running prompt: the query loop adds it to the
+    /// conversation before its next model request. Returns the id that
+    /// [`SessionState::unqueue_message`] accepts, or `None` when no prompt is
+    /// running (the client then sends it as a new prompt).
+    pub fn queue_message(&self, text: String) -> Option<u64> {
+        let slot = self.active_turn.lock();
+        let turn = slot.as_ref()?;
+        Some(turn.queue.push(QueuedCommand::InjectUserMessage(text), CommandPriority::Normal))
+    }
+
+    /// Take back a queued message the query loop has not delivered yet.
+    pub fn unqueue_message(&self, id: u64) -> bool {
+        let slot = self.active_turn.lock();
+        slot.as_ref().is_some_and(|turn| turn.queue.remove(id).is_some())
     }
 
     /// Cancel the running prompt, if any. Returns whether a turn was running.
     pub fn cancel_turn(&self) -> bool {
         match self.active_turn.lock().as_ref() {
-            Some(token) => {
-                token.cancel();
+            Some(turn) => {
+                turn.token.cancel();
                 true
             }
             None => false,
@@ -137,10 +157,33 @@ impl SessionState {
     }
 }
 
+struct TurnSlot {
+    token: CancellationToken,
+    queue: CommandQueue,
+}
+
 /// A running prompt turn. Dropping it marks the session idle again.
 pub struct ActiveTurn<'a> {
-    slot: &'a parking_lot::Mutex<Option<CancellationToken>>,
+    slot: &'a parking_lot::Mutex<Option<TurnSlot>>,
     pub token: CancellationToken,
+    /// Messages the client queued while this turn runs.
+    pub queue: CommandQueue,
+}
+
+impl ActiveTurn<'_> {
+    /// Mark the session idle and return the queued messages the query loop
+    /// never delivered, in order. Done under the slot lock, so a message is
+    /// either returned here or refused by [`SessionState::queue_message`].
+    pub fn finish(self) -> Vec<String> {
+        *self.slot.lock() = None;
+        let mut left = Vec::new();
+        for command in self.queue.drain() {
+            if let QueuedCommand::InjectUserMessage(text) = command {
+                left.push(text);
+            }
+        }
+        left
+    }
 }
 
 impl Drop for ActiveTurn<'_> {

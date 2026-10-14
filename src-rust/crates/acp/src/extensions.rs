@@ -16,6 +16,19 @@
 //!   `_` are reserved by ACP for extensions.
 //!
 //! Clients that do not opt in get the plain ACP stream, unchanged.
+//!
+//! Two extension requests let a client add input to a running prompt, like a
+//! message typed in the terminal UI while the agent works (advertised as
+//! `agentCapabilities._meta.claurst.queueMessages`):
+//!
+//! - `_claurst/queue_message` `{ "sessionId", "text" }` → `{ "queued": true, "id" }`,
+//!   or `{ "queued": false }` when no prompt is running. The message joins the
+//!   conversation before the next model request (a `input_injected` session
+//!   event reports it); one queued during the final step makes the turn go on.
+//! - `_claurst/unqueue_message` `{ "sessionId", "id" }` → `{ "removed": bool }`.
+//!
+//! Messages a cancelled turn never delivered come back in the prompt
+//! response, `_meta.claurst.undeliveredMessages`.
 
 use agent_client_protocol_schema as acp;
 use claurst_query::{QueryEvent, TokenWarningState};
@@ -23,6 +36,11 @@ use serde_json::{json, Value};
 
 /// Method of the extension notification carrying session events.
 pub const SESSION_EVENT: &str = "_claurst/session_event";
+
+/// Request adding a message to the running prompt.
+pub const QUEUE_MESSAGE: &str = "_claurst/queue_message";
+/// Request taking back a queued message not delivered yet.
+pub const UNQUEUE_MESSAGE: &str = "_claurst/unqueue_message";
 
 /// The extensions a client opted into.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -96,6 +114,12 @@ pub fn session_event(event: &QueryEvent) -> Option<Value> {
         QueryEvent::Status(message) => json!({
             "type": "status",
             "message": message,
+        }),
+        // Queued messages (`_claurst/queue_message`) that just joined the
+        // conversation, in queue order.
+        QueryEvent::InputInjected(texts) => json!({
+            "type": "input_injected",
+            "messages": texts,
         }),
         _ => return None,
     })

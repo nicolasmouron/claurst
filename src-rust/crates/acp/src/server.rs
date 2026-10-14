@@ -112,6 +112,19 @@ impl AgentServer {
                 let result = self.on_prompt(req).await?;
                 serde_json::to_value(result).map_err(|_| acp::Error::internal_error())
             }
+            crate::extensions::QUEUE_MESSAGE => {
+                let req: QueueMessage = parse_params(params)?;
+                let session = self.session_for(&req.session_id)?;
+                Ok(match session.queue_message(req.text) {
+                    Some(id) => serde_json::json!({ "queued": true, "id": id }),
+                    None => serde_json::json!({ "queued": false }),
+                })
+            }
+            crate::extensions::UNQUEUE_MESSAGE => {
+                let req: UnqueueMessage = parse_params(params)?;
+                let session = self.session_for(&req.session_id)?;
+                Ok(serde_json::json!({ "removed": session.unqueue_message(req.id) }))
+            }
             other => {
                 warn!(method = other, "ACP: method not found");
                 Err(acp::Error::method_not_found())
@@ -170,7 +183,13 @@ impl AgentServer {
                     // Images pass through when the session's provider accepts
                     // them and are replaced by a short note otherwise.
                     .prompt_capabilities(acp::PromptCapabilities::new().image(true))
-                    .mcp_capabilities(acp::McpCapabilities::new()),
+                    .mcp_capabilities(acp::McpCapabilities::new())
+                    // Input can be queued into a running prompt (extensions.rs).
+                    .meta(
+                        serde_json::json!({ "claurst": { "queueMessages": true } })
+                            .as_object()
+                            .cloned(),
+                    ),
             );
         response = response.agent_info(Some(agent_info));
         Ok(response)
@@ -289,6 +308,15 @@ impl AgentServer {
         permission_manager
     }
 
+    fn session_for(&self, id: &acp::SessionId) -> Result<Arc<SessionState>, acp::Error> {
+        self.sessions.get(id).ok_or_else(|| {
+            acp::Error::invalid_params().data(Some(serde_json::json!({
+                "reason": "unknown session",
+                "sessionId": id,
+            })))
+        })
+    }
+
     async fn on_prompt(
         self: &Arc<Self>,
         req: acp::PromptRequest,
@@ -305,6 +333,20 @@ impl AgentServer {
         let ext = ClientExtensions::from_capabilities(&self.client_capabilities.read());
         crate::prompt::handle(self.connection.clone(), session, req, ext).await
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueMessage {
+    session_id: acp::SessionId,
+    text: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnqueueMessage {
+    session_id: acp::SessionId,
+    id: u64,
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result<T, acp::Error> {

@@ -123,25 +123,39 @@ pub async fn handle(
     // most the step in flight and `session/load` finds the rest.
     let mut query_config = runtime.query_config.clone();
     query_config.session_journal = Some(session.journal.clone());
+    // Messages the client queues during the turn (`_claurst/queue_message`)
+    // join the conversation before the next model request.
+    query_config.command_queue = Some(turn.queue.clone());
 
-    // Run the query loop.
-    let outcome = claurst_query::run_query_loop(
-        runtime.api_client.as_ref(),
-        &mut messages,
-        runtime.tools.as_slice(),
-        &tool_ctx,
-        &query_config,
-        runtime.cost_tracker.clone(),
-        Some(ev_tx),
-        cancel,
-        None,
-    )
-    .await;
+    // Run the query loop. Input queued during the final step, after the
+    // loop's last drain, is answered in the same turn by running it again.
+    let outcome = loop {
+        let outcome = claurst_query::run_query_loop(
+            runtime.api_client.as_ref(),
+            &mut messages,
+            runtime.tools.as_slice(),
+            &tool_ctx,
+            &query_config,
+            runtime.cost_tracker.clone(),
+            Some(ev_tx.clone()),
+            cancel.clone(),
+            None,
+        )
+        .await;
+        let ended = matches!(outcome, QueryOutcome::EndTurn { .. });
+        if ended && !cancel.is_cancelled() && !turn.queue.is_empty() {
+            continue;
+        }
+        break outcome;
+    };
+    drop(ev_tx);
+    // Anything still queued (cancelled or failed turn) goes back to the client.
+    let undelivered = turn.finish();
 
     // Tear down forwarder + drainer.
     drainer_cancel.cancel();
     let _ = drainer.await;
-    // Forwarder finishes when ev_tx is dropped at end of run_query_loop.
+    // Forwarder finishes once every ev_tx clone is dropped.
     let mut stats = forwarder.await.unwrap_or_default();
 
     // Persist the updated transcript, in memory and on disk.
@@ -187,6 +201,7 @@ pub async fn handle(
             "costUsd": turn_cost,
             "contextUsed": stats.last.as_ref().map(UsageInfo::total),
             "contextSize": context_size,
+            "undeliveredMessages": undelivered,
         }
     });
     Ok(acp::PromptResponse::new(stop_reason)
