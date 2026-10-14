@@ -77,8 +77,6 @@ impl AgentRuntime {
             client_config,
         ));
 
-        let cost_tracker = CostTracker::new();
-
         // MCP servers from the settings for this directory — connect upfront
         // so their tools are visible to every session here. Per-session MCP
         // servers supplied via `session/new` params are not routed yet.
@@ -96,6 +94,12 @@ impl AgentRuntime {
         let mut query_config = QueryConfig::from_config(&config);
         query_config.working_directory = Some(working_dir.display().to_string());
         query_config.provider_registry = Some(provider_registry.clone());
+        // Without the catalogue every model falls back to the Claude-centric
+        // window heuristic (100k), so compaction fired far too early on
+        // larger self-hosted models.
+        query_config.model_registry = Some(model_registry(&config));
+        // Price the session's model, not the tracker's default (Opus).
+        let cost_tracker = CostTracker::with_model(&query_config.model);
 
         // System context (git status, ...) for this directory, assembled like
         // the CLI does.
@@ -138,6 +142,21 @@ impl AgentRuntime {
             supports_images,
         })
     }
+}
+
+/// Model catalogue like the CLI's: the bundled snapshot, the models.dev cache
+/// written by `claurst models --refresh` (or `CLAURST_MODELS_PATH`), and the
+/// user's `modelOverrides`, which size self-hosted models.
+pub(crate) fn model_registry(config: &Config) -> Arc<claurst_api::ModelRegistry> {
+    let mut registry = claurst_api::ModelRegistry::new();
+    let cache = std::env::var_os("CLAURST_MODELS_PATH")
+        .map(PathBuf::from)
+        .or_else(|| dirs::cache_dir().map(|dir| dir.join("claurst").join("models.json")));
+    if let Some(path) = cache {
+        registry.load_cache(&path);
+    }
+    registry.apply_model_overrides(&config.model_overrides);
+    Arc::new(registry)
 }
 
 /// Whether the provider `config` selects accepts image input.
@@ -184,4 +203,27 @@ pub(crate) async fn build_mcp_manager(
         return None;
     }
     Some(claurst_mcp::McpManager::connect_all(&decision.allowed).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claurst_core::config::ModelOverride;
+
+    #[test]
+    fn model_overrides_size_the_context_window() {
+        let mut config = Config::default();
+        config.model_overrides.insert(
+            "custom-openai/local-qwen".to_string(),
+            ModelOverride { context_window: Some(131_072), ..Default::default() },
+        );
+        let registry = model_registry(&config);
+        let window = |model: &str| {
+            claurst_query::compact::resolve_context_window(Some(&registry), "custom-openai", model)
+        };
+        assert_eq!(window("custom-openai/local-qwen"), 131_072);
+        assert_eq!(window("local-qwen"), 131_072);
+        // Unknown models still get the heuristic.
+        assert_eq!(window("custom-openai/other"), 100_000);
+    }
 }

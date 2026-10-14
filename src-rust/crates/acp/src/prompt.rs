@@ -7,15 +7,20 @@ use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
 use claurst_api::streaming::{AnthropicStreamEvent, ContentDelta};
+use claurst_core::history::CompactionRecord;
 use claurst_core::permissions::ManagedInteractivePermissionHandler;
-use claurst_core::types::{ContentBlock, ImageSource, Message};
+use claurst_core::types::{ContentBlock, ImageSource, Message, Role, UsageInfo};
+use claurst_core::CostTracker;
 use claurst_query::{QueryEvent, QueryOutcome};
 use claurst_tools::ToolContext;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::connection::Connection;
+use crate::extensions::{self, ClientExtensions};
+use crate::runtime::AgentRuntime;
 use crate::sessions::SessionState;
 
 /// Handle one `session/prompt` JSON-RPC call.
@@ -29,6 +34,7 @@ pub async fn handle(
     connection: Arc<Connection>,
     session: Arc<SessionState>,
     params: acp::PromptRequest,
+    ext: ClientExtensions,
 ) -> Result<acp::PromptResponse, acp::Error> {
     let runtime = &session.runtime;
     // Convert prompt content blocks → a single user message in Claurst's
@@ -95,12 +101,28 @@ pub async fn handle(
     );
 
     // Event channel + forwarder.
+    let cost_before = runtime.cost_tracker.total_cost_usd();
+    let report = TurnReport {
+        ext,
+        context_size: context_window(runtime),
+        cost_tracker: runtime.cost_tracker.clone(),
+        start: Counters::read(&runtime.cost_tracker),
+        cost_before,
+        session_cost_before: session.total_cost(),
+    };
+    let context_size = report.context_size;
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<QueryEvent>();
     let forwarder = tokio::spawn(forward_events(
         connection.clone(),
         session.session_id.clone(),
         ev_rx,
+        report,
     ));
+
+    // The query loop journals every step of the turn, so a crash loses at
+    // most the step in flight and `session/load` finds the rest.
+    let mut query_config = runtime.query_config.clone();
+    query_config.session_journal = Some(session.journal.clone());
 
     // Run the query loop.
     let outcome = claurst_query::run_query_loop(
@@ -108,7 +130,7 @@ pub async fn handle(
         &mut messages,
         runtime.tools.as_slice(),
         &tool_ctx,
-        &runtime.query_config,
+        &query_config,
         runtime.cost_tracker.clone(),
         Some(ev_tx),
         cancel,
@@ -120,13 +142,23 @@ pub async fn handle(
     drainer_cancel.cancel();
     let _ = drainer.await;
     // Forwarder finishes when ev_tx is dropped at end of run_query_loop.
-    let _ = forwarder.await;
+    let mut stats = forwarder.await.unwrap_or_default();
 
-    // Persist the updated transcript.
-    {
-        let mut guard = session.messages.lock();
-        *guard = messages;
+    // Persist the updated transcript, in memory and on disk.
+    let turn_cost = (runtime.cost_tracker.total_cost_usd() - cost_before).max(0.0);
+    let compactions = std::mem::take(&mut stats.compactions);
+    if let Err(e) = session.checkpoint(&messages, compactions, turn_cost, stats.usage.total()) {
+        warn!(error = %e, session_id = %session.session_id, "ACP: could not save the session");
+        if ext.session_events {
+            send_session_event(
+                &connection,
+                &session.session_id,
+                json!({ "type": "save_failed", "message": e.to_string() }),
+            )
+            .await;
+        }
     }
+    *session.messages.lock() = messages;
 
     let stop_reason = match outcome {
         QueryOutcome::EndTurn { .. } => acp::StopReason::EndTurn,
@@ -143,7 +175,88 @@ pub async fn handle(
         }
     };
 
-    Ok(acp::PromptResponse::new(stop_reason))
+    let usage = acp::Usage::new(
+        stats.usage.total(),
+        stats.usage.input_tokens,
+        stats.usage.output_tokens,
+    )
+    .cached_read_tokens(stats.usage.cache_read_input_tokens)
+    .cached_write_tokens(stats.usage.cache_creation_input_tokens);
+    let meta = json!({
+        "claurst": {
+            "costUsd": turn_cost,
+            "contextUsed": stats.last.as_ref().map(UsageInfo::total),
+            "contextSize": context_size,
+        }
+    });
+    Ok(acp::PromptResponse::new(stop_reason)
+        .usage(usage)
+        .meta(meta.as_object().cloned()))
+}
+
+/// Context window of the session's model, as the query loop measures it.
+fn context_window(runtime: &AgentRuntime) -> u64 {
+    claurst_query::compact::resolve_context_window(
+        runtime.query_config.model_registry.as_deref(),
+        runtime.config.selected_provider_id(),
+        &runtime.query_config.model,
+    )
+}
+
+/// What the event forwarder needs to report usage while the turn runs.
+struct TurnReport {
+    ext: ClientExtensions,
+    context_size: u64,
+    cost_tracker: Arc<CostTracker>,
+    /// Tracker counters when the turn started.
+    start: Counters,
+    cost_before: f64,
+    session_cost_before: f64,
+}
+
+/// What a turn used, gathered from the query loop's events.
+#[derive(Default)]
+struct TurnStats {
+    /// Every model request of the turn, sub-agents included.
+    usage: UsageInfo,
+    /// The last request: its prompt plus output is the context now in use.
+    last: Option<UsageInfo>,
+    compactions: Vec<CompactionRecord>,
+}
+
+/// Token counters of a [`CostTracker`]. Every model request adds to them, on
+/// every provider path, so the difference between two readings is what the
+/// requests in between used. (`TurnComplete` is not emitted after a
+/// tool-use response on every path, so it cannot be used for this.) The
+/// tracker is shared by the sessions of one directory: a turn running there
+/// at the same time would be counted too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Counters {
+    input: u64,
+    output: u64,
+    cache_write: u64,
+    cache_read: u64,
+}
+
+impl Counters {
+    fn read(tracker: &CostTracker) -> Self {
+        Self {
+            input: tracker.input_tokens(),
+            output: tracker.output_tokens(),
+            cache_write: tracker.cache_creation_tokens(),
+            cache_read: tracker.cache_read_tokens(),
+        }
+    }
+
+    /// Usage between `earlier` and this reading.
+    fn since(self, earlier: Self) -> UsageInfo {
+        UsageInfo {
+            input_tokens: self.input.saturating_sub(earlier.input),
+            output_tokens: self.output.saturating_sub(earlier.output),
+            cache_creation_input_tokens: self.cache_write.saturating_sub(earlier.cache_write),
+            cache_read_input_tokens: self.cache_read.saturating_sub(earlier.cache_read),
+        }
+    }
 }
 
 /// Convert prompt content blocks into one user message. Text, resource links
@@ -214,16 +327,25 @@ fn user_message(blocks: Vec<acp::ContentBlock>, supports_images: bool) -> Option
     Some(Message::user_blocks(images))
 }
 
-/// Pump QueryEvents → `session/update` SessionNotifications.
+/// Pump QueryEvents → `session/update` SessionNotifications, plus the
+/// extensions the client opted into. Returns what the turn used.
 async fn forward_events(
     connection: Arc<Connection>,
     session_id: acp::SessionId,
     mut rx: mpsc::UnboundedReceiver<QueryEvent>,
-) {
+    report: TurnReport,
+) -> TurnStats {
     // Track tool calls so ToolEnd updates carry the right title and kind.
     let mut active_tools: HashMap<String, ToolMeta> = HashMap::new();
+    let mut stats = TurnStats::default();
+    let mut mark = report.start;
 
     while let Some(event) = rx.recv().await {
+        if report.ext.session_events {
+            if let Some(payload) = extensions::session_event(&event) {
+                send_session_event(&connection, &session_id, payload).await;
+            }
+        }
         match event {
             QueryEvent::Stream(AnthropicStreamEvent::ContentBlockDelta { delta, .. }) => {
                 match delta {
@@ -307,8 +429,42 @@ async fn forward_events(
                 send_text_chunk(&connection, &session_id, &format!("\n[error: {}]", msg), false)
                     .await;
             }
+            // A model response is final: what it used is on the tracker.
+            QueryEvent::MessageCommitted(message) if message.role == Role::Assistant => {
+                let now = Counters::read(&report.cost_tracker);
+                let request = now.since(mark);
+                mark = now;
+                let used = request.total();
+                stats.last = Some(request);
+                if report.ext.usage_updates {
+                    let spent = (report.cost_tracker.total_cost_usd() - report.cost_before).max(0.0);
+                    let update = acp::UsageUpdate::new(used, report.context_size)
+                        .cost(acp::Cost::new(report.session_cost_before + spent, "USD"));
+                    send_session_update(
+                        &connection,
+                        &session_id,
+                        acp::SessionUpdate::UsageUpdate(update),
+                    )
+                    .await;
+                }
+            }
+            QueryEvent::Compacted(record) => stats.compactions.push(record),
             _ => {}
         }
+    }
+    stats.usage = Counters::read(&report.cost_tracker).since(report.start);
+    stats
+}
+
+/// Send a `_claurst/session_event` extension notification.
+async fn send_session_event(
+    connection: &Arc<Connection>,
+    session_id: &acp::SessionId,
+    event: Value,
+) {
+    let params = json!({ "sessionId": session_id, "event": event });
+    if let Err(e) = connection.send_notification(extensions::SESSION_EVENT, params).await {
+        warn!(?e, "ACP: failed to send a session event");
     }
 }
 
@@ -334,7 +490,7 @@ async fn send_text_chunk(
     send_session_update(connection, session_id, update).await;
 }
 
-async fn send_session_update(
+pub(crate) async fn send_session_update(
     connection: &Arc<Connection>,
     session_id: &acp::SessionId,
     update: acp::SessionUpdate,
@@ -347,7 +503,7 @@ async fn send_session_update(
     }
 }
 
-fn classify_tool_kind(tool_name: &str) -> acp::ToolKind {
+pub(crate) fn classify_tool_kind(tool_name: &str) -> acp::ToolKind {
     match tool_name {
         "Read" | "FileRead" => acp::ToolKind::Read,
         "Edit" | "FileEdit" | "Write" | "FileWrite" | "BatchEdit" | "ApplyPatch" => {
@@ -365,7 +521,7 @@ fn classify_tool_kind(tool_name: &str) -> acp::ToolKind {
 
 /// Compose a short, human-readable title for a tool call. Falls back to the
 /// tool's bare name if no descriptive field is present.
-fn tool_title(tool_name: &str, raw_input: Option<&serde_json::Value>) -> String {
+pub(crate) fn tool_title(tool_name: &str, raw_input: Option<&serde_json::Value>) -> String {
     if let Some(input) = raw_input {
         // Prefer path-like fields for file tools.
         for key in &["file_path", "path", "filename", "url", "pattern", "command"] {

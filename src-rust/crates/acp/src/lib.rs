@@ -13,6 +13,7 @@
 //! | `initialize`                 | C → A      | Capability negotiation                      |
 //! | `authenticate`               | C → A      | No-op (Claurst uses local credentials)      |
 //! | `session/new`                | C → A      | Create a session with cwd + MCP roster      |
+//! | `session/load`               | C → A      | Reopen a saved session, replaying its history |
 //! | `session/prompt`             | C → A      | Run a turn; streams `session/update` events |
 //! | `session/cancel`             | C → A (no resp) | Cancel an in-flight prompt             |
 //! | `session/update`             | A → C (no resp) | Streamed text/tool deltas              |
@@ -24,8 +25,10 @@
 //! (see `src-rust/plan/migration-todo.md`).
 
 mod connection;
+mod extensions;
 mod permission;
 mod prompt;
+mod replay;
 mod runtime;
 mod server;
 mod sessions;

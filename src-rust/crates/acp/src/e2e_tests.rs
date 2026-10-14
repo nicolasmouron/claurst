@@ -119,7 +119,7 @@ impl claurst_api::LlmProvider for ScriptedProvider {
                 }),
                 Ok(StreamEvent::MessageDelta {
                     stop_reason: Some(StopReason::EndTurn),
-                    usage: Some(UsageInfo::default()),
+                    usage: Some(text_step_usage()),
                 }),
                 Ok(StreamEvent::MessageStop),
             ],
@@ -165,6 +165,16 @@ impl claurst_api::LlmProvider for ScriptedProvider {
             structured_output: false,
             system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
         }
+    }
+}
+
+/// Usage every `Step::Text` request reports.
+pub(crate) fn text_step_usage() -> UsageInfo {
+    UsageInfo {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_creation_input_tokens: 3,
+        cache_read_input_tokens: 7,
     }
 }
 
@@ -222,6 +232,8 @@ pub(crate) struct Client {
     pub hold_permissions: AtomicBool,
     /// Every `session/update` notification the agent sent.
     pub updates: Arc<parking_lot::Mutex<Vec<Value>>>,
+    /// Every `_claurst/session_event` notification the agent sent.
+    pub events: Arc<parking_lot::Mutex<Vec<Value>>>,
 }
 
 impl Client {
@@ -253,6 +265,7 @@ impl Client {
             permission_answers: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
             hold_permissions: AtomicBool::new(false),
             updates: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            events: Arc::new(parking_lot::Mutex::new(Vec::new())),
         });
         tokio::spawn(Self::read_loop(client.clone(), client_read));
         client
@@ -277,6 +290,7 @@ impl Client {
                     self.write(&reply).await;
                 }
                 Some("session/update") => self.updates.lock().push(msg["params"].clone()),
+                Some(crate::extensions::SESSION_EVENT) => self.events.lock().push(msg["params"].clone()),
                 Some(other) => panic!("unexpected agent message: {other}"),
                 None => {
                     let id = msg["id"].as_i64().expect("response id");
@@ -314,6 +328,20 @@ impl Client {
         let params = serde_json::to_value(params).expect("serialize params");
         self.write(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
             .await;
+    }
+
+    /// `initialize`, opting into the Claurst extensions.
+    pub async fn initialize_with_extensions(&self) -> Value {
+        self.call(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "_meta": { "claurst": { "sessionEvents": true, "usageUpdates": true } }
+                },
+            }),
+        )
+        .await
     }
 
     pub async fn new_session(&self, cwd: &Path) -> acp::SessionId {
@@ -764,4 +792,167 @@ async fn cancel_while_a_permission_request_is_pending_unwinds_the_tool() {
     assert!(!target.exists(), "a cancelled write must not touch the file");
     assert_eq!(tool_statuses(&client), vec!["failed"]);
     assert_eq!(client.permission_requests.lock().len(), 1);
+}
+
+/// `sessionUpdate` kinds the agent sent, in order.
+fn update_kinds(client: &Client) -> Vec<String> {
+    client
+        .updates
+        .lock()
+        .iter()
+        .map(|u| u["update"]["sessionUpdate"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prompt_response_reports_the_turn_usage() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("usage");
+    let provider = ScriptedProvider::new(vec![Step::Text("hi")]);
+    let client = Client::start(scripted_runtime(&cwd, provider));
+    let session_id = client.new_session(&cwd).await;
+
+    let response = client.prompt(&session_id, "hello").await;
+    let result = &response["result"];
+    assert_eq!(result["usage"]["inputTokens"], 100, "{result}");
+    assert_eq!(result["usage"]["outputTokens"], 20);
+    assert_eq!(result["usage"]["cachedReadTokens"], 7);
+    assert_eq!(result["usage"]["cachedWriteTokens"], 3);
+    assert_eq!(result["usage"]["totalTokens"], 130);
+    assert_eq!(result["_meta"]["claurst"]["contextUsed"], 130);
+    assert!(result["_meta"]["claurst"]["contextSize"].as_u64().unwrap_or(0) > 0, "{result}");
+
+    // A client that did not opt in gets the plain ACP stream.
+    assert!(!update_kinds(&client).contains(&"usage_update".to_string()));
+    assert!(client.events.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opted_in_client_gets_usage_updates_and_the_turn_cap_event() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("events");
+    let file = cwd.join("notes.txt");
+    std::fs::write(&file, "hello").expect("seed file");
+    let provider = ScriptedProvider::new(vec![
+        Step::Tool("Read", json!({ "file_path": file })),
+        Step::Tool("Read", json!({ "file_path": file })),
+        Step::Text("summary"),
+    ]);
+    let mut runtime = scripted_runtime(&cwd, provider);
+    runtime.query_config.max_turns = 1;
+    let client = Client::start(runtime);
+    client.initialize_with_extensions().await;
+    let session_id = client.new_session(&cwd).await;
+
+    client.prompt(&session_id, "read the notes").await;
+
+    let events = client.events.lock().clone();
+    assert!(
+        events.iter().any(|e| e["sessionId"] == session_id.0.as_ref()
+            && e["event"]["type"] == "max_turns"
+            && e["event"]["maxTurns"] == 1),
+        "{events:?}"
+    );
+    let usage: Vec<Value> = client
+        .updates
+        .lock()
+        .iter()
+        .filter(|u| u["update"]["sessionUpdate"] == "usage_update")
+        .cloned()
+        .collect();
+    assert!(!usage.is_empty(), "no usage_update in {:?}", update_kinds(&client));
+    assert!(usage[0]["update"]["size"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(usage[0]["update"]["cost"]["currency"], "USD");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_turn_is_saved_to_the_sessions_directory() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("save");
+    let provider = ScriptedProvider::new(vec![Step::Text("first answer")]);
+    let client = Client::start(scripted_runtime(&cwd, provider));
+    let session_id = client.new_session(&cwd).await;
+
+    client.prompt(&session_id, "hello there").await;
+
+    let saved = claurst_core::session_journal::load(
+        &claurst_core::history::sessions_dir(),
+        session_id.0.as_ref(),
+    )
+    .expect("the session is saved after its first turn")
+    .session;
+    assert_eq!(saved.messages.len(), 2, "{:?}", saved.messages);
+    assert_eq!(saved.messages[1].get_all_text(), "first answer");
+    assert_eq!(saved.title.as_deref(), Some("hello there"));
+    assert_eq!(saved.working_dir.as_deref(), Some(cwd.display().to_string().as_str()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_session_is_loaded_replayed_and_continued() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("load");
+    // A session saved by an earlier process.
+    let mut saved = claurst_core::history::ConversationSession::new("scripted-model".into());
+    saved.id = "acp-saved-earlier".into();
+    saved.working_dir = Some(cwd.display().to_string());
+    saved.messages = vec![
+        claurst_core::types::Message::user("hello"),
+        claurst_core::types::Message::assistant("first answer"),
+    ];
+    claurst_core::session_journal::save(&claurst_core::history::sessions_dir(), &mut saved)
+        .expect("seed saved session");
+
+    let provider = ScriptedProvider::new(vec![Step::Text("second answer")]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let init = client.initialize_with_extensions().await;
+    assert_eq!(init["result"]["agentCapabilities"]["loadSession"], true, "{init}");
+
+    let load = client
+        .call("session/load", acp::LoadSessionRequest::new("acp-saved-earlier", cwd.clone()))
+        .await;
+    assert!(load.get("error").is_none(), "{load}");
+    let replayed: Vec<(String, String)> = client
+        .updates
+        .lock()
+        .iter()
+        .map(|u| {
+            (
+                u["update"]["sessionUpdate"].as_str().unwrap_or_default().to_string(),
+                u["update"]["content"]["text"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        replayed,
+        vec![
+            ("user_message_chunk".to_string(), "hello".to_string()),
+            ("agent_message_chunk".to_string(), "first answer".to_string()),
+        ]
+    );
+
+    let session_id = acp::SessionId::new("acp-saved-earlier");
+    let response = client.prompt(&session_id, "and then?").await;
+    assert_eq!(stop_reason(&response), acp::StopReason::EndTurn);
+    let sent = provider.requests.lock()[0].messages.clone();
+    assert_eq!(sent.len(), 3, "the model sees the loaded history: {sent:?}");
+    assert_eq!(sent[1].get_all_text(), "first answer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn load_refuses_unknown_and_unsafe_session_ids() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("load-bad");
+    let client = Client::start(scripted_runtime(&cwd, ScriptedProvider::new(Vec::new())));
+
+    let unknown = client
+        .call("session/load", acp::LoadSessionRequest::new("acp-never-saved", cwd.clone()))
+        .await;
+    let error: acp::Error = serde_json::from_value(unknown["error"].clone()).expect("unknown id is an error");
+    assert_eq!(error.code, acp::ErrorCode::ResourceNotFound);
+
+    let unsafe_id = client
+        .call("session/load", acp::LoadSessionRequest::new("../../settings", cwd.clone()))
+        .await;
+    let error: acp::Error = serde_json::from_value(unsafe_id["error"].clone()).expect("unsafe id is an error");
+    assert_eq!(error.code, acp::ErrorCode::InvalidParams);
 }

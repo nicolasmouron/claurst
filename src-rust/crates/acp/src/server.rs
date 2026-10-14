@@ -11,8 +11,9 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::connection::{Connection, Inbound};
+use crate::extensions::ClientExtensions;
 use crate::runtime::AgentRuntime;
-use crate::sessions::{SessionRegistry, SessionState};
+use crate::sessions::{valid_session_id, SessionRegistry, SessionState};
 
 /// The ACP agent: owns the connection, the per-directory runtimes, and the
 /// session registry.
@@ -102,9 +103,9 @@ impl AgentServer {
                 serde_json::to_value(result).map_err(|_| acp::Error::internal_error())
             }
             "session/load" => {
-                // v1: not supported. Capability is advertised as false in
-                // initialize so a well-behaved client never calls this.
-                Err(acp::Error::method_not_found())
+                let req: acp::LoadSessionRequest = parse_params(params)?;
+                let result = self.on_load_session(req).await?;
+                serde_json::to_value(result).map_err(|_| acp::Error::internal_error())
             }
             "session/prompt" => {
                 let req: acp::PromptRequest = parse_params(params)?;
@@ -163,7 +164,9 @@ impl AgentServer {
         let mut response = acp::InitializeResponse::new(acp::ProtocolVersion::V1)
             .agent_capabilities(
                 acp::AgentCapabilities::new()
-                    .load_session(false)
+                    // Sessions are saved in ~/.claurst/sessions like the
+                    // CLI's, and `session/load` replays them.
+                    .load_session(true)
                     // Images pass through when the session's provider accepts
                     // them and are replaced by a short note otherwise.
                     .prompt_capabilities(acp::PromptCapabilities::new().image(true))
@@ -183,24 +186,7 @@ impl AgentServer {
         }
         let runtime = self.runtime_for(&req.cwd).await?;
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
-        // Read the global rules fresh so approvals saved by earlier sessions
-        // apply here too.
-        let mode = runtime.config.permission_mode.clone();
-        let permission_manager = match Settings::load_sync() {
-            Ok(settings) => PermissionManager::new(mode, &settings),
-            Err(e) => {
-                warn!(error = %e, "ACP: could not reload settings, using the runtime's permission rules");
-                PermissionManager::new(mode, &runtime.settings)
-            }
-        };
-        // Project approvals for this cwd, and the configured allow/deny lists.
-        let mut permission_manager = permission_manager.with_project_store(
-            claurst_core::permissions::project_approvals_path(
-                &Settings::config_dir(),
-                &claurst_core::permissions::approvals_project_root(&req.cwd),
-            ),
-        );
-        permission_manager.sync_config(&runtime.config);
+        let permission_manager = self.permission_manager_for(&runtime, &req.cwd);
         let state = SessionState::new(session_id.clone(), runtime, permission_manager);
         info!(session_id = %session_id, cwd = %req.cwd.display(), "ACP: new session");
 
@@ -216,6 +202,93 @@ impl AgentServer {
         Ok(acp::NewSessionResponse::new(session_id))
     }
 
+    /// Reopen a session saved by this or an earlier process and replay its
+    /// history to the client.
+    async fn on_load_session(
+        self: &Arc<Self>,
+        req: acp::LoadSessionRequest,
+    ) -> Result<acp::LoadSessionResponse, acp::Error> {
+        if !req.cwd.is_absolute() {
+            return Err(acp::Error::invalid_params()
+                .data(Some(serde_json::json!({ "reason": "cwd must be absolute" }))));
+        }
+        let id = req.session_id.0.to_string();
+        if !valid_session_id(&id) {
+            return Err(acp::Error::invalid_params()
+                .data(Some(serde_json::json!({ "reason": "invalid session id" }))));
+        }
+
+        let state = match self.sessions.get(&req.session_id) {
+            Some(state) => {
+                if state.is_busy() {
+                    return Err(acp::Error::new(
+                        i32::from(acp::ErrorCode::InvalidRequest),
+                        format!("Session {id} has a prompt running"),
+                    ));
+                }
+                state
+            }
+            None => {
+                let loaded = claurst_core::session_journal::load(
+                    &claurst_core::history::sessions_dir(),
+                    &id,
+                )
+                .map_err(|e| {
+                    acp::Error::resource_not_found(Some(id.clone()))
+                        .data(Some(serde_json::json!({ "reason": e.to_string() })))
+                })?;
+                let mut record = loaded.session;
+                record.working_dir = Some(req.cwd.display().to_string());
+                let runtime = self.runtime_for(&req.cwd).await?;
+                let permission_manager = self.permission_manager_for(&runtime, &req.cwd);
+                let state = SessionState::from_record(
+                    req.session_id.clone(),
+                    runtime,
+                    permission_manager,
+                    record,
+                );
+                // Take the session's lock now, so a session still open in
+                // another claurst process is refused instead of losing the
+                // turns saved here.
+                state.journal.acquire().map_err(|e| {
+                    acp::Error::new(i32::from(acp::ErrorCode::InvalidRequest), e.to_string())
+                })?;
+                self.sessions.insert(state.clone());
+                info!(session_id = %id, cwd = %req.cwd.display(), "ACP: session loaded");
+                state
+            }
+        };
+
+        let messages = state.messages.lock().clone();
+        crate::replay::replay(&self.connection, &state.session_id, &messages).await;
+        Ok(acp::LoadSessionResponse::new())
+    }
+
+    /// Permission rules for a session in `cwd`: the global rules (re-read so
+    /// approvals saved by earlier sessions apply), the project's approvals,
+    /// and the runtime's allow/deny lists.
+    fn permission_manager_for(&self, runtime: &AgentRuntime, cwd: &std::path::Path) -> PermissionManager {
+        // Read the global rules fresh so approvals saved by earlier sessions
+        // apply here too.
+        let mode = runtime.config.permission_mode.clone();
+        let permission_manager = match Settings::load_sync() {
+            Ok(settings) => PermissionManager::new(mode, &settings),
+            Err(e) => {
+                warn!(error = %e, "ACP: could not reload settings, using the runtime's permission rules");
+                PermissionManager::new(mode, &runtime.settings)
+            }
+        };
+        // Project approvals for this cwd, and the configured allow/deny lists.
+        let mut permission_manager = permission_manager.with_project_store(
+            claurst_core::permissions::project_approvals_path(
+                &Settings::config_dir(),
+                &claurst_core::permissions::approvals_project_root(cwd),
+            ),
+        );
+        permission_manager.sync_config(&runtime.config);
+        permission_manager
+    }
+
     async fn on_prompt(
         self: &Arc<Self>,
         req: acp::PromptRequest,
@@ -229,7 +302,8 @@ impl AgentServer {
                 }))));
             }
         };
-        crate::prompt::handle(self.connection.clone(), session, req).await
+        let ext = ClientExtensions::from_capabilities(&self.client_capabilities.read());
+        crate::prompt::handle(self.connection.clone(), session, req, ext).await
     }
 }
 

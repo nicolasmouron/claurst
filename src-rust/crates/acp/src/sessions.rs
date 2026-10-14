@@ -4,8 +4,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
+use claurst_core::history::{CompactionRecord, ConversationSession};
 use claurst_core::permissions::PermissionManager;
-use claurst_core::types::Message;
+use claurst_core::session_journal::SessionJournal;
+use claurst_core::types::{Message, Role};
 use claurst_tools::PendingPermissionStore;
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
@@ -30,6 +32,12 @@ pub struct SessionState {
     pub permission_manager: Arc<std::sync::Mutex<PermissionManager>>,
     pub file_history: Arc<parking_lot::Mutex<claurst_core::file_history::FileHistory>>,
     pub current_turn: Arc<std::sync::atomic::AtomicUsize>,
+    /// What is saved in `~/.claurst/sessions/<id>.json`, so a later process
+    /// can `session/load` this session. Its `messages` are refreshed at the
+    /// end of every turn.
+    pub record: parking_lot::Mutex<ConversationSession>,
+    /// Crash-safe writer for `record`: the query loop journals every step.
+    pub journal: Arc<SessionJournal>,
 }
 
 impl SessionState {
@@ -38,11 +46,25 @@ impl SessionState {
         runtime: Arc<AgentRuntime>,
         permission_manager: PermissionManager,
     ) -> Arc<Self> {
+        let mut record = ConversationSession::new(runtime.query_config.model.clone());
+        record.id = session_id.0.to_string();
+        record.working_dir = Some(runtime.working_dir.display().to_string());
+        Self::from_record(session_id, runtime, permission_manager, record)
+    }
+
+    /// A session restored from its saved record (`session/load`).
+    pub fn from_record(
+        session_id: acp::SessionId,
+        runtime: Arc<AgentRuntime>,
+        permission_manager: PermissionManager,
+        record: ConversationSession,
+    ) -> Arc<Self> {
+        let journal = SessionJournal::for_session(&record);
         Arc::new(Self {
             session_id,
             cwd: runtime.working_dir.clone(),
             runtime,
-            messages: parking_lot::Mutex::new(Vec::new()),
+            messages: parking_lot::Mutex::new(record.messages.clone()),
             active_turn: parking_lot::Mutex::new(None),
             pending_permissions: Arc::new(parking_lot::Mutex::new(
                 PendingPermissionStore::default(),
@@ -52,7 +74,40 @@ impl SessionState {
                 claurst_core::file_history::FileHistory::new(),
             )),
             current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            record: parking_lot::Mutex::new(record),
+            journal,
         })
+    }
+
+    /// Whether a prompt is running on this session.
+    pub fn is_busy(&self) -> bool {
+        self.active_turn.lock().is_some()
+    }
+
+    /// Record a finished turn and checkpoint the session to disk. The query
+    /// loop already journaled each step; this writes the snapshot.
+    pub fn checkpoint(
+        &self,
+        messages: &[Message],
+        compactions: Vec<CompactionRecord>,
+        turn_cost_usd: f64,
+        turn_tokens: u64,
+    ) -> anyhow::Result<()> {
+        let mut record = self.record.lock();
+        record.messages = messages.to_vec();
+        record.compactions.extend(compactions);
+        record.updated_at = chrono::Utc::now();
+        record.total_cost += turn_cost_usd;
+        record.total_tokens += turn_tokens;
+        if record.title.is_none() {
+            record.title = first_user_line(messages);
+        }
+        claurst_core::session_journal::save(&claurst_core::history::sessions_dir(), &mut record)
+    }
+
+    /// Cost of the session so far, in USD.
+    pub fn total_cost(&self) -> f64 {
+        self.record.lock().total_cost
     }
 
     /// Start a prompt turn with a fresh cancellation token. Returns `None`
@@ -92,6 +147,21 @@ impl Drop for ActiveTurn<'_> {
     fn drop(&mut self) {
         *self.slot.lock() = None;
     }
+}
+
+/// First line of the first user message, as the saved session's title.
+fn first_user_line(messages: &[Message]) -> Option<String> {
+    let text = messages.iter().find(|m| m.role == Role::User)?.get_all_text();
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(line.chars().take(80).collect())
+}
+
+/// Whether `id` can name a saved session. Ids become file names in the
+/// sessions directory, so anything that could leave it is refused.
+pub fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Map of active sessions keyed by ACP session id.
@@ -187,6 +257,22 @@ mod tests {
         let removed = registry.remove(&id).expect("session should be present to remove");
         assert!(Arc::ptr_eq(&removed, &state));
         assert!(registry.get(&id).is_none());
+    }
+
+    #[test]
+    fn session_ids_that_could_leave_the_sessions_directory_are_refused() {
+        assert!(valid_session_id("acp-1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed"));
+        assert!(valid_session_id("abc_DEF-123"));
+        for bad in ["", "../secrets", "a/b", "a\\b", "C:x", "a.json", &"x".repeat(129)] {
+            assert!(!valid_session_id(bad), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn title_is_the_first_non_empty_line_of_the_first_user_message() {
+        let messages = vec![Message::user("\n  fix the build\nthen run tests")];
+        assert_eq!(first_user_line(&messages).as_deref(), Some("fix the build"));
+        assert_eq!(first_user_line(&[]), None);
     }
 
     #[test]
