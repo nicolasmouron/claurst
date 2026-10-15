@@ -4,7 +4,7 @@
 //!
 //! ```json
 //! { "provider": "custom-openai2", "model": "custom-openai2/qwen", "apiBase": "http://host:8080/v1",
-//!   "effort": "low", "maxTurns": 100, "maxTokens": 8000, "thinking": 4000, "maxBudgetUsd": 2.5,
+//!   "effort": "low", "agent": "plan", "maxTurns": 100, "maxTokens": 8000, "thinking": 4000, "maxBudgetUsd": 2.5,
 //!   "fallbackModel": "provider/model", "autoCompact": false,
 //!   "allowedTools": "Read, Bash(git:*)", "disallowedTools": "WebFetch",
 //!   "additionalDirs": ["/abs/path"], "noClaudeMd": true, "autoCommits": true }
@@ -14,6 +14,8 @@ use std::path::PathBuf;
 
 use agent_client_protocol_schema as acp;
 use claurst_core::config::Config;
+use claurst_core::AgentDefinition;
+use claurst_tools::{PermissionLevel, Tool};
 use claurst_core::effort::EffortLevel;
 use claurst_core::permissions::{parse_rule_spec, split_rule_specs, PermissionAction};
 use claurst_query::QueryConfig;
@@ -31,6 +33,10 @@ pub struct SessionOptions {
     pub api_base: Option<String>,
     /// Reasoning effort (`--effort`): low, medium, high, max or none.
     pub effort: Option<String>,
+    /// Named agent (`--agent`): a built-in one (build, plan, explore) or one
+    /// from the settings' `agents`. Its prompt, model and turn cap apply, and
+    /// its access level restricts the tools offered to the model.
+    pub agent: Option<String>,
     /// Model requests per prompt (`--max-turns`).
     pub max_turns: Option<u32>,
     /// Output tokens per response (`--max-tokens`).
@@ -56,6 +62,20 @@ pub struct SessionOptions {
 }
 
 impl SessionOptions {
+    /// Refuse an agent name that neither the settings nor the built-ins define.
+    pub fn check_agent(&self, config: &Config) -> Result<(), String> {
+        match self.agent.as_deref().filter(|a| !a.is_empty()) {
+            Some(name) if agent_definition(config, name).is_none() => {
+                let mut known: Vec<String> = claurst_core::default_agents().into_keys().collect();
+                known.extend(config.agents.keys().cloned());
+                known.sort();
+                known.dedup();
+                Err(format!("unknown agent {name:?} (known: {})", known.join(", ")))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The options of a `session/new` or `session/load` request: absent means
     /// the defaults; invalid ones are an error for the client to show.
     pub fn from_meta(meta: Option<&acp::Meta>) -> Result<Self, String> {
@@ -126,6 +146,20 @@ impl SessionOptions {
         }
     }
 
+    /// The prompt's query-loop settings. The named agent, if any, comes from
+    /// `config` (the session's view of the settings).
+    pub fn apply_query_with_agent(&self, query: &mut QueryConfig, config: &Config) {
+        self.apply_query(query);
+        let Some(name) = self.agent.as_deref().filter(|a| !a.is_empty()) else { return };
+        let Some(definition) = agent_definition(config, name) else { return };
+        // Like `--agent`: the agent's turn cap applies, unless the session sets its own.
+        if let (Some(turns), None) = (definition.max_turns, self.max_turns) {
+            query.max_turns = turns;
+        }
+        query.agent_name = Some(name.to_string());
+        query.agent_definition = Some(definition);
+    }
+
     /// The prompt's query-loop settings.
     pub fn apply_query(&self, query: &mut QueryConfig) {
         if let Some(model) = &self.model {
@@ -156,6 +190,39 @@ impl SessionOptions {
             query.instruction_files.clear();
         }
     }
+}
+
+/// Definition of a named agent: the settings' `agents` over the built-ins.
+pub fn agent_definition(config: &Config, name: &str) -> Option<AgentDefinition> {
+    config.agents.get(name).cloned().or_else(|| claurst_core::default_agents().remove(name))
+}
+
+/// The tools an agent's access level allows, rebuilt from the built-in tools
+/// like the CLI's `--agent` does (MCP tools and sub-agents are left out of the
+/// restricted levels), or `None` for full access. The plan-mode tools only
+/// switch the terminal UI's mode, so they are left out too: in ACP they would
+/// tell the model it may now write.
+pub fn tools_for_access(tools: &[Box<dyn Tool>], access: &str) -> Option<Vec<Box<dyn Tool>>> {
+    const PLAN_MODE_TOOLS: &[&str] = &["EnterPlanMode", "ExitPlanMode"];
+    const SEARCH_TOOLS: &[&str] = &["Grep", "Glob", "Read", "WebSearch", "WebFetch"];
+    let allowed: Vec<String> = match access {
+        "read-only" => tools
+            .iter()
+            .filter(|t| {
+                matches!(t.permission_level(), PermissionLevel::ReadOnly | PermissionLevel::None)
+                    || t.name() == "AskUserQuestion"
+            })
+            .map(|t| t.name().to_string())
+            .collect(),
+        "search-only" => SEARCH_TOOLS.iter().map(|n| n.to_string()).collect(),
+        _ => return None,
+    };
+    Some(
+        claurst_tools::all_tools()
+            .into_iter()
+            .filter(|t| allowed.iter().any(|n| n == t.name()) && !PLAN_MODE_TOOLS.contains(&t.name()))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -221,6 +288,39 @@ mod tests {
         o.apply_query(&mut query);
         assert_eq!(query.model, "custom-openai2/qwen");
         assert_eq!(query.effort_level, EffortLevel::from_str("high"));
+    }
+
+    #[test]
+    fn the_plan_agent_reads_and_never_writes() {
+        let tools = claurst_tools::all_tools();
+        let names = |list: &[Box<dyn Tool>]| list.iter().map(|t| t.name().to_string()).collect::<Vec<_>>();
+        let plan = names(&tools_for_access(&tools, "read-only").unwrap());
+        assert!(plan.iter().any(|n| n == "Read") && plan.iter().any(|n| n == "Grep"));
+        for forbidden in ["Write", "Edit", "Bash", "ApplyPatch", "ExitPlanMode", "EnterPlanMode"] {
+            assert!(!plan.iter().any(|n| n == forbidden), "{forbidden} offered to the plan agent");
+        }
+        let explore = names(&tools_for_access(&tools, "search-only").unwrap());
+        assert!(explore.iter().all(|n| ["Grep", "Glob", "Read", "WebSearch", "WebFetch"].contains(&n.as_str())));
+        assert!(tools_for_access(&tools, "full").is_none());
+    }
+
+    #[test]
+    fn a_named_agent_brings_its_definition_and_turn_cap() {
+        let config = Config::default();
+        let o = SessionOptions::from_meta(Some(&meta(json!({ "agent": "plan" })))).unwrap();
+        assert!(o.check_agent(&config).is_ok());
+        let mut query = QueryConfig::from_config(&config);
+        o.apply_query_with_agent(&mut query, &config);
+        assert_eq!(query.agent_name.as_deref(), Some("plan"));
+        assert_eq!(query.max_turns, 20, "the plan agent's own cap");
+
+        let o = SessionOptions::from_meta(Some(&meta(json!({ "agent": "plan", "maxTurns": 60 })))).unwrap();
+        let mut query = QueryConfig::from_config(&config);
+        o.apply_query_with_agent(&mut query, &config);
+        assert_eq!(query.max_turns, 60, "the session's own cap wins");
+
+        let unknown = SessionOptions::from_meta(Some(&meta(json!({ "agent": "wizard" })))).unwrap();
+        assert!(unknown.check_agent(&config).unwrap_err().contains("plan"));
     }
 
     #[test]

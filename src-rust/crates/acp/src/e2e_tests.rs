@@ -1186,3 +1186,31 @@ async fn two_sessions_use_their_own_model() {
     let models: Vec<String> = provider.requests.lock().iter().map(|r| r.model.clone()).collect();
     assert_eq!(models, ["model-a", "model-b"]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_session_only_offers_read_tools() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("plan-agent");
+    let provider = ScriptedProvider::new(vec![Step::Text("here is the plan")]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let init = client.initialize_with_extensions().await;
+    assert_eq!(init["result"]["agentCapabilities"]["_meta"]["claurst"]["sessionAgents"], true);
+    let response =
+        new_session_with(&client, &cwd, json!({ "claurst": { "options": { "agent": "plan" } } })).await;
+    let session_id: acp::SessionId =
+        serde_json::from_value(response["result"]["sessionId"].clone()).expect("session id");
+
+    client.prompt(&session_id, "plan the refactor").await;
+    let requests = provider.requests.lock();
+    let tools: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(tools.contains(&"Read"), "{tools:?}");
+    for forbidden in ["Write", "Edit", "Bash", "ExitPlanMode"] {
+        assert!(!tools.contains(&forbidden), "{forbidden} offered in plan mode: {tools:?}");
+    }
+    let system = serde_json::to_string(&requests[0].system_prompt).unwrap();
+    assert!(system.contains("You are the plan agent"), "the agent's prompt is used");
+
+    let unknown =
+        new_session_with(&client, &cwd, json!({ "claurst": { "options": { "agent": "wizard" } } })).await;
+    assert_eq!(unknown["error"]["code"], -32602);
+}

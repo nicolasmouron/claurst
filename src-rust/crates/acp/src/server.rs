@@ -186,7 +186,7 @@ impl AgentServer {
                     .mcp_capabilities(acp::McpCapabilities::new())
                     // Input can be queued into a running prompt (extensions.rs).
                     .meta(
-                        serde_json::json!({ "claurst": { "queueMessages": true, "sessionModel": true } })
+                        serde_json::json!({ "claurst": { "queueMessages": true, "sessionModel": true, "sessionAgents": true } })
                             .as_object()
                             .cloned(),
                     ),
@@ -207,6 +207,9 @@ impl AgentServer {
             acp::Error::invalid_params().data(Some(serde_json::json!({ "reason": reason })))
         })?;
         let runtime = self.runtime_for(&req.cwd).await?;
+        options.check_agent(&runtime.config).map_err(|reason| {
+            acp::Error::invalid_params().data(Some(serde_json::json!({ "reason": reason })))
+        })?;
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
         let permission_manager = self.permission_manager_for(&runtime, &req.cwd, &options);
         let state = SessionState::new(session_id.clone(), runtime, permission_manager);
@@ -268,6 +271,9 @@ impl AgentServer {
                 let mut record = loaded.session;
                 record.working_dir = Some(req.cwd.display().to_string());
                 let runtime = self.runtime_for(&req.cwd).await?;
+                options.check_agent(&runtime.config).map_err(|reason| {
+                    acp::Error::invalid_params().data(Some(serde_json::json!({ "reason": reason })))
+                })?;
                 let permission_manager = self.permission_manager_for(&runtime, &req.cwd, &options);
                 let state = SessionState::from_record(
                     req.session_id.clone(),

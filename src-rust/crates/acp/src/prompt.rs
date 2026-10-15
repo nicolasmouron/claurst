@@ -43,7 +43,13 @@ pub async fn handle(
     let mut config = runtime.config.clone();
     options.apply_config(&mut config);
     let mut query_config = runtime.query_config.clone();
-    options.apply_query(&mut query_config);
+    options.apply_query_with_agent(&mut query_config, &config);
+    // A named agent with restricted access only gets the tools it may use.
+    let agent_tools = query_config
+        .agent_definition
+        .as_ref()
+        .and_then(|agent| crate::options::tools_for_access(runtime.tools.as_slice(), &agent.access));
+    let tools = agent_tools.as_deref().unwrap_or(runtime.tools.as_slice());
     let context_size = context_window(runtime, &config, &query_config.model);
     let supports_images = if options.provider.is_some() {
         crate::runtime::provider_accepts_images(&config, &runtime.provider_registry)
@@ -150,7 +156,7 @@ pub async fn handle(
         let outcome = claurst_query::run_query_loop(
             runtime.api_client.as_ref(),
             &mut messages,
-            runtime.tools.as_slice(),
+            tools,
             &tool_ctx,
             &query_config,
             runtime.cost_tracker.clone(),
