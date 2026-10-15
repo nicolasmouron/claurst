@@ -186,7 +186,7 @@ impl AgentServer {
                     .mcp_capabilities(acp::McpCapabilities::new())
                     // Input can be queued into a running prompt (extensions.rs).
                     .meta(
-                        serde_json::json!({ "claurst": { "queueMessages": true } })
+                        serde_json::json!({ "claurst": { "queueMessages": true, "sessionModel": true } })
                             .as_object()
                             .cloned(),
                     ),

@@ -37,9 +37,22 @@ pub async fn handle(
     ext: ClientExtensions,
 ) -> Result<acp::PromptResponse, acp::Error> {
     let runtime = &session.runtime;
+    // The session's options on top of the runtime settings (its provider and
+    // model, tool rules, extra directories, snapshots, query-loop limits).
+    let options = session.options.lock().clone();
+    let mut config = runtime.config.clone();
+    options.apply_config(&mut config);
+    let mut query_config = runtime.query_config.clone();
+    options.apply_query(&mut query_config);
+    let context_size = context_window(runtime, &config, &query_config.model);
+    let supports_images = if options.provider.is_some() {
+        crate::runtime::provider_accepts_images(&config, &runtime.provider_registry)
+    } else {
+        runtime.supports_images
+    };
     // Convert prompt content blocks → a single user message in Claurst's
     // internal format.
-    let Some(message) = user_message(params.prompt, runtime.supports_images) else {
+    let Some(message) = user_message(params.prompt, supports_images) else {
         return Err(acp::Error::invalid_params()
             .data(Some(serde_json::json!({ "reason": "prompt has no text or image content" }))));
     };
@@ -66,11 +79,6 @@ pub async fn handle(
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> = Arc::new(
         ManagedInteractivePermissionHandler::new(session.permission_manager.clone()),
     );
-    // The session's options on top of the runtime settings (tool rules, extra
-    // directories, snapshots, query-loop limits).
-    let options = session.options.lock().clone();
-    let mut config = runtime.config.clone();
-    options.apply_config(&mut config);
     let tool_ctx = ToolContext {
         working_dir: session.cwd.clone(),
         permission_mode: config.permission_mode.clone(),
@@ -109,13 +117,12 @@ pub async fn handle(
     let cost_before = runtime.cost_tracker.total_cost_usd();
     let report = TurnReport {
         ext,
-        context_size: context_window(runtime),
+        context_size,
         cost_tracker: runtime.cost_tracker.clone(),
         start: Counters::read(&runtime.cost_tracker),
         cost_before,
         session_cost_before: session.total_cost(),
     };
-    let context_size = report.context_size;
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<QueryEvent>();
     let forwarder = tokio::spawn(forward_events(
         connection.clone(),
@@ -126,12 +133,10 @@ pub async fn handle(
 
     // The query loop journals every step of the turn, so a crash loses at
     // most the step in flight and `session/load` finds the rest.
-    let mut query_config = runtime.query_config.clone();
     query_config.session_journal = Some(session.journal.clone());
     // Messages the client queues during the turn (`_claurst/queue_message`)
     // join the conversation before the next model request.
     query_config.command_queue = Some(turn.queue.clone());
-    options.apply_query(&mut query_config);
     if let Some(extra) = session.append_system_prompt.lock().clone() {
         query_config.append_system_prompt = Some(match query_config.append_system_prompt.take() {
             Some(base) if !base.trim().is_empty() => format!("{base}{sep}{extra}", sep = "\n\n"),
@@ -222,11 +227,11 @@ pub async fn handle(
 }
 
 /// Context window of the session's model, as the query loop measures it.
-fn context_window(runtime: &AgentRuntime) -> u64 {
+fn context_window(runtime: &AgentRuntime, config: &claurst_core::config::Config, model: &str) -> u64 {
     claurst_query::compact::resolve_context_window(
         runtime.query_config.model_registry.as_deref(),
-        runtime.config.selected_provider_id(),
-        &runtime.query_config.model,
+        config.selected_provider_id(),
+        model,
     )
 }
 

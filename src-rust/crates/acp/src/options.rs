@@ -3,7 +3,8 @@
 //! mirror the CLI flags of the same name and apply to that session only:
 //!
 //! ```json
-//! { "maxTurns": 100, "maxTokens": 8000, "thinking": 4000, "maxBudgetUsd": 2.5,
+//! { "provider": "custom-openai2", "model": "custom-openai2/qwen", "apiBase": "http://host:8080/v1",
+//!   "effort": "low", "maxTurns": 100, "maxTokens": 8000, "thinking": 4000, "maxBudgetUsd": 2.5,
 //!   "fallbackModel": "provider/model", "autoCompact": false,
 //!   "allowedTools": "Read, Bash(git:*)", "disallowedTools": "WebFetch",
 //!   "additionalDirs": ["/abs/path"], "noClaudeMd": true, "autoCommits": true }
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 
 use agent_client_protocol_schema as acp;
 use claurst_core::config::Config;
+use claurst_core::effort::EffortLevel;
 use claurst_core::permissions::{parse_rule_spec, split_rule_specs, PermissionAction};
 use claurst_query::QueryConfig;
 use serde::Deserialize;
@@ -20,6 +22,15 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct SessionOptions {
+    /// Provider of the session's model (`--provider`): several sessions can
+    /// use different providers in one process.
+    pub provider: Option<String>,
+    /// Model, `provider/model` or bare (`--model`).
+    pub model: Option<String>,
+    /// Base URL of that provider for this session (`--api-base`).
+    pub api_base: Option<String>,
+    /// Reasoning effort (`--effort`): low, medium, high, max or none.
+    pub effort: Option<String>,
     /// Model requests per prompt (`--max-turns`).
     pub max_turns: Option<u32>,
     /// Output tokens per response (`--max-tokens`).
@@ -68,6 +79,16 @@ impl SessionOptions {
         if let Some(dir) = options.additional_dirs.iter().find(|d| !d.is_absolute()) {
             return Err(format!("additionalDirs must be absolute: {}", dir.display()));
         }
+        if let Some(effort) = options.effort.as_deref().filter(|e| !e.is_empty()) {
+            if EffortLevel::from_str(effort).is_none() {
+                return Err(format!("invalid effort {effort:?}"));
+            }
+        }
+        for (name, value) in [("provider", &options.provider), ("model", &options.model)] {
+            if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                return Err(format!("{name} must not be empty"));
+            }
+        }
         if options.max_turns == Some(0) {
             return Err("maxTurns must be at least 1".to_string());
         }
@@ -77,6 +98,19 @@ impl SessionOptions {
     /// The session's view of the runtime settings: tool rules, extra
     /// directories, snapshots. Feeds the permission manager and the tools.
     pub fn apply_config(&self, config: &mut Config) {
+        if let Some(provider) = &self.provider {
+            config.provider = Some(provider.clone());
+        }
+        if let Some(model) = &self.model {
+            config.model = Some(model.clone());
+        }
+        if let Some(base) = self.api_base.as_ref().filter(|b| !b.trim().is_empty()) {
+            let id = config.selected_provider_id().to_string();
+            config.provider_configs.entry(id).or_default().api_base = Some(base.clone());
+        }
+        if let Some(effort) = self.effort.as_ref().filter(|e| !e.is_empty()) {
+            config.effort = Some(effort.clone());
+        }
         let specs = |list: &Option<String>| list.as_deref().map(split_rule_specs).unwrap_or_default();
         config.allowed_tools.extend(specs(&self.allowed_tools));
         config.disallowed_tools.extend(specs(&self.disallowed_tools));
@@ -94,6 +128,12 @@ impl SessionOptions {
 
     /// The prompt's query-loop settings.
     pub fn apply_query(&self, query: &mut QueryConfig) {
+        if let Some(model) = &self.model {
+            query.model = model.clone();
+        }
+        if let Some(effort) = self.effort.as_deref().and_then(EffortLevel::from_str) {
+            query.effort_level = Some(effort);
+        }
         if let Some(turns) = self.max_turns {
             query.max_turns = turns;
         }
@@ -163,6 +203,27 @@ mod tests {
     }
 
     #[test]
+    fn a_session_picks_its_own_provider_model_and_effort() {
+        let o = SessionOptions::from_meta(Some(&meta(json!({
+            "provider": "custom-openai2", "model": "custom-openai2/qwen",
+            "apiBase": "http://pixelia03:3002/v1", "effort": "high",
+        }))))
+        .unwrap();
+        let mut config = Config::default();
+        config.provider = Some("custom-openai".into());
+        o.apply_config(&mut config);
+        assert_eq!(config.selected_provider_id(), "custom-openai2");
+        assert_eq!(
+            config.provider_configs["custom-openai2"].api_base.as_deref(),
+            Some("http://pixelia03:3002/v1")
+        );
+        let mut query = QueryConfig::from_config(&Config::default());
+        o.apply_query(&mut query);
+        assert_eq!(query.model, "custom-openai2/qwen");
+        assert_eq!(query.effort_level, EffortLevel::from_str("high"));
+    }
+
+    #[test]
     fn invalid_options_are_refused() {
         for bad in [
             json!({ "allowedTools": "Bash(unclosed" }),
@@ -170,6 +231,8 @@ mod tests {
             json!({ "maxTurns": 0 }),
             json!({ "maxTurns": "many" }),
             json!({ "unknownOption": true }),
+            json!({ "effort": "extreme" }),
+            json!({ "provider": " " }),
         ] {
             assert!(SessionOptions::from_meta(Some(&meta(bad.clone()))).is_err(), "{bad}");
         }

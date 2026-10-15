@@ -1159,3 +1159,30 @@ async fn invalid_session_options_are_refused() {
     assert_eq!(error.code, acp::ErrorCode::InvalidParams);
     assert!(error.data.unwrap().to_string().contains("allowedTools"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_sessions_use_their_own_model() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("session-models");
+    let provider = ScriptedProvider::new(vec![Step::Text("from a"), Step::Text("from b")]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let init = client.initialize_with_extensions().await;
+    assert_eq!(init["result"]["agentCapabilities"]["_meta"]["claurst"]["sessionModel"], true);
+
+    let mut sessions = Vec::new();
+    for model in ["scripted/model-a", "scripted/model-b"] {
+        let response = new_session_with(
+            &client,
+            &cwd,
+            json!({ "claurst": { "options": { "provider": "scripted", "model": model, "effort": "low" } } }),
+        )
+        .await;
+        sessions.push(
+            serde_json::from_value::<acp::SessionId>(response["result"]["sessionId"].clone()).expect("session id"),
+        );
+    }
+    client.prompt(&sessions[0], "hello a").await;
+    client.prompt(&sessions[1], "hello b").await;
+    let models: Vec<String> = provider.requests.lock().iter().map(|r| r.model.clone()).collect();
+    assert_eq!(models, ["model-a", "model-b"]);
+}

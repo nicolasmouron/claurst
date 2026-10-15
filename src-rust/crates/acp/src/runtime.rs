@@ -165,9 +165,12 @@ pub(crate) fn provider_accepts_images(
     registry: &claurst_api::ProviderRegistry,
 ) -> bool {
     let id = claurst_core::provider_id::ProviderId::new(config.selected_provider_id());
-    registry
-        .get(&id)
-        .is_some_and(|provider| provider.capabilities().image_input)
+    match registry.get(&id) {
+        Some(provider) => provider.capabilities().image_input,
+        // A provider only a session names (its address in the session options).
+        None => claurst_api::registry::provider_from_config(config, config.selected_provider_id())
+            .is_some_and(|provider| provider.capabilities().image_input),
+    }
 }
 
 pub(crate) async fn build_mcp_manager(
