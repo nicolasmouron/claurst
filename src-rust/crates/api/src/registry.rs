@@ -292,8 +292,31 @@ pub fn provider_from_config(
         "codex" | "openai-codex" => {
             CodexProvider::from_stored().map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>)
         }
-        _ => api_key.and_then(|key| provider_from_key(provider_id, key)),
+        _ => match api_key.clone().and_then(|key| provider_from_key(provider_id, key)) {
+            Some(provider) => Some(provider),
+            None => user_compat_provider(provider_id, api_base, api_key),
+        },
     }
+}
+
+/// A provider the user declared under `providers.<id>` with an `api_base`,
+/// under an id claurst has no backend for: an OpenAI-compatible server with
+/// its own address and key (`auth.json` → `credentials.<id>.key`, or the
+/// entry's `api_key`). Lets several self-hosted servers sit side by side,
+/// where `custom-openai` holds a single address and key. The key is optional:
+/// local servers often need none.
+fn user_compat_provider(
+    provider_id: &str,
+    api_base: Option<String>,
+    api_key: Option<String>,
+) -> Option<Arc<dyn LlmProvider>> {
+    if is_known_provider_id(provider_id) {
+        return None;
+    }
+    let base = api_base.filter(|base| !base.trim().is_empty())?;
+    let provider = crate::providers::OpenAiCompatProvider::new(provider_id, provider_id, base)
+        .with_api_key(api_key.unwrap_or_default());
+    Some(Arc::new(provider))
 }
 
 pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
@@ -721,6 +744,37 @@ mod tests {
         registry.set_default(ProviderId::new("lmstudio"));
 
         assert_eq!(&**registry.default_provider_id(), ProviderId::LM_STUDIO);
+    }
+
+    #[test]
+    fn a_user_declared_openai_compatible_provider_gets_its_own_address_and_key() {
+        let mut config = claurst_core::config::Config::default();
+        for (id, base, key) in [
+            ("pixelia", "http://pixelia03:3002/v1", Some("key-a")),
+            ("local-gpu", "http://100.84.108.75:8080/v1", None),
+        ] {
+            config.provider_configs.insert(
+                id.to_string(),
+                claurst_core::config::ProviderConfig {
+                    api_base: Some(base.to_string()),
+                    api_key: key.map(str::to_string),
+                    ..Default::default()
+                },
+            );
+        }
+        let pixelia = provider_from_config(&config, "pixelia").expect("declared provider");
+        assert_eq!(pixelia.id(), &ProviderId::new("pixelia"));
+        let local = provider_from_config(&config, "local-gpu").expect("a key is optional");
+        assert_eq!(local.id(), &ProviderId::new("local-gpu"));
+
+        // Both are registered side by side.
+        let registry = ProviderRegistry::from_config(&config, ClientConfig::default());
+        assert!(registry.get(&ProviderId::new("pixelia")).is_some());
+        assert!(registry.get(&ProviderId::new("local-gpu")).is_some());
+
+        // An unknown id without an address is still nothing.
+        config.provider_configs.insert("nowhere".to_string(), Default::default());
+        assert!(provider_from_config(&config, "nowhere").is_none());
     }
 
     #[test]
