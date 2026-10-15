@@ -66,9 +66,14 @@ pub async fn handle(
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> = Arc::new(
         ManagedInteractivePermissionHandler::new(session.permission_manager.clone()),
     );
+    // The session's options on top of the runtime settings (tool rules, extra
+    // directories, snapshots, query-loop limits).
+    let options = session.options.lock().clone();
+    let mut config = runtime.config.clone();
+    options.apply_config(&mut config);
     let tool_ctx = ToolContext {
         working_dir: session.cwd.clone(),
-        permission_mode: runtime.config.permission_mode.clone(),
+        permission_mode: config.permission_mode.clone(),
         permission_handler,
         cost_tracker: runtime.cost_tracker.clone(),
         session_id: session.session_id.0.to_string(),
@@ -76,7 +81,7 @@ pub async fn handle(
         current_turn: session.current_turn.clone(),
         non_interactive: false, // ACP routes permissions via the bridge
         mcp_manager: runtime.mcp_manager.clone(),
-        config: runtime.config.clone(),
+        config,
         managed_agent_config: runtime.config.managed_agents.clone(),
         completion_notifier: None,
         pending_permissions: Some(session.pending_permissions.clone()),
@@ -126,6 +131,7 @@ pub async fn handle(
     // Messages the client queues during the turn (`_claurst/queue_message`)
     // join the conversation before the next model request.
     query_config.command_queue = Some(turn.queue.clone());
+    options.apply_query(&mut query_config);
     if let Some(extra) = session.append_system_prompt.lock().clone() {
         query_config.append_system_prompt = Some(match query_config.append_system_prompt.take() {
             Some(base) if !base.trim().is_empty() => format!("{base}{sep}{extra}", sep = "\n\n"),

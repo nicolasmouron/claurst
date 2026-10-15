@@ -203,12 +203,16 @@ impl AgentServer {
             return Err(acp::Error::invalid_params()
                 .data(Some(serde_json::json!({ "reason": "cwd must be absolute" }))));
         }
+        let options = crate::options::SessionOptions::from_meta(req.meta.as_ref()).map_err(|reason| {
+            acp::Error::invalid_params().data(Some(serde_json::json!({ "reason": reason })))
+        })?;
         let runtime = self.runtime_for(&req.cwd).await?;
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
-        let permission_manager = self.permission_manager_for(&runtime, &req.cwd);
+        let permission_manager = self.permission_manager_for(&runtime, &req.cwd, &options);
         let state = SessionState::new(session_id.clone(), runtime, permission_manager);
         *state.append_system_prompt.lock() =
             crate::extensions::session_system_prompt(req.meta.as_ref());
+        *state.options.lock() = options;
         info!(session_id = %session_id, cwd = %req.cwd.display(), "ACP: new session");
 
         // v1: ignore req.mcp_servers — agent uses settings.json MCP roster.
@@ -238,6 +242,9 @@ impl AgentServer {
             return Err(acp::Error::invalid_params()
                 .data(Some(serde_json::json!({ "reason": "invalid session id" }))));
         }
+        let options = crate::options::SessionOptions::from_meta(req.meta.as_ref()).map_err(|reason| {
+            acp::Error::invalid_params().data(Some(serde_json::json!({ "reason": reason })))
+        })?;
 
         let state = match self.sessions.get(&req.session_id) {
             Some(state) => {
@@ -261,7 +268,7 @@ impl AgentServer {
                 let mut record = loaded.session;
                 record.working_dir = Some(req.cwd.display().to_string());
                 let runtime = self.runtime_for(&req.cwd).await?;
-                let permission_manager = self.permission_manager_for(&runtime, &req.cwd);
+                let permission_manager = self.permission_manager_for(&runtime, &req.cwd, &options);
                 let state = SessionState::from_record(
                     req.session_id.clone(),
                     runtime,
@@ -282,6 +289,7 @@ impl AgentServer {
         // The client restates its instructions on every load; none clears them.
         *state.append_system_prompt.lock() =
             crate::extensions::session_system_prompt(req.meta.as_ref());
+        *state.options.lock() = options;
 
         let messages = state.messages.lock().clone();
         crate::replay::replay(&self.connection, &state.session_id, &messages).await;
@@ -291,7 +299,12 @@ impl AgentServer {
     /// Permission rules for a session in `cwd`: the global rules (re-read so
     /// approvals saved by earlier sessions apply), the project's approvals,
     /// and the runtime's allow/deny lists.
-    fn permission_manager_for(&self, runtime: &AgentRuntime, cwd: &std::path::Path) -> PermissionManager {
+    fn permission_manager_for(
+        &self,
+        runtime: &AgentRuntime,
+        cwd: &std::path::Path,
+        options: &crate::options::SessionOptions,
+    ) -> PermissionManager {
         // Read the global rules fresh so approvals saved by earlier sessions
         // apply here too.
         let mode = runtime.config.permission_mode.clone();
@@ -309,7 +322,10 @@ impl AgentServer {
                 &claurst_core::permissions::approvals_project_root(cwd),
             ),
         );
-        permission_manager.sync_config(&runtime.config);
+        // The session's own allow/deny rules come on top of the configured ones.
+        let mut config = runtime.config.clone();
+        options.apply_config(&mut config);
+        permission_manager.sync_config(&config);
         permission_manager
     }
 

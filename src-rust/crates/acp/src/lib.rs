@@ -29,6 +29,7 @@
 
 mod connection;
 mod extensions;
+mod options;
 mod permission;
 mod prompt;
 mod replay;

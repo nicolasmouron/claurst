@@ -1111,3 +1111,51 @@ async fn session_instructions_reach_the_system_prompt() {
     let system = serde_json::to_string(&provider.requests.lock()[0].system_prompt).unwrap();
     assert!(system.contains("Verify your work before you stop."), "{system}");
 }
+
+async fn new_session_with(client: &Client, cwd: &Path, meta: Value) -> Value {
+    let mut request = acp::NewSessionRequest::new(cwd.to_path_buf());
+    request.meta = meta.as_object().cloned();
+    client.call("session/new", request).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_options_deny_tools_and_size_responses() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("session-options");
+    let file = cwd.join("notes.txt");
+    std::fs::write(&file, "hello").expect("seed file");
+    let provider = ScriptedProvider::new(vec![
+        Step::Tool("Read", json!({ "file_path": file })),
+        Step::Text("could not read"),
+    ]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let response = new_session_with(
+        &client,
+        &cwd,
+        json!({ "claurst": { "options": { "disallowedTools": "Read", "maxTokens": 1234 } } }),
+    )
+    .await;
+    let session_id: acp::SessionId =
+        serde_json::from_value(response["result"]["sessionId"].clone()).expect("session id");
+
+    client.prompt(&session_id, "read the notes").await;
+    assert_eq!(tool_statuses(&client), vec!["failed"], "Read is denied for this session");
+    assert!(client.permission_requests.lock().is_empty(), "a denied tool is not asked for");
+    assert_eq!(provider.requests.lock()[0].max_tokens, 1234);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_session_options_are_refused() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("bad-options");
+    let client = Client::start(scripted_runtime(&cwd, ScriptedProvider::new(vec![])));
+    let response = new_session_with(
+        &client,
+        &cwd,
+        json!({ "claurst": { "options": { "allowedTools": "Bash(unclosed" } } }),
+    )
+    .await;
+    let error: acp::Error = serde_json::from_value(response["error"].clone()).expect("an error");
+    assert_eq!(error.code, acp::ErrorCode::InvalidParams);
+    assert!(error.data.unwrap().to_string().contains("allowedTools"));
+}

@@ -43,6 +43,8 @@ pub struct SessionState {
     /// Instructions the client added to the system prompt for this session
     /// (`_meta.claurst.appendSystemPrompt` of `session/new` / `session/load`).
     pub append_system_prompt: parking_lot::Mutex<Option<String>>,
+    /// Options the client set for this session (`_meta.claurst.options`).
+    pub options: parking_lot::Mutex<crate::options::SessionOptions>,
 }
 
 impl SessionState {
@@ -82,6 +84,7 @@ impl SessionState {
             record: parking_lot::Mutex::new(record),
             journal,
             append_system_prompt: parking_lot::Mutex::new(None),
+            options: parking_lot::Mutex::new(Default::default()),
         })
     }
 
