@@ -126,6 +126,12 @@ pub async fn handle(
     // Messages the client queues during the turn (`_claurst/queue_message`)
     // join the conversation before the next model request.
     query_config.command_queue = Some(turn.queue.clone());
+    if let Some(extra) = session.append_system_prompt.lock().clone() {
+        query_config.append_system_prompt = Some(match query_config.append_system_prompt.take() {
+            Some(base) if !base.trim().is_empty() => format!("{base}{sep}{extra}", sep = "\n\n"),
+            _ => extra,
+        });
+    }
 
     // Run the query loop. Input queued during the final step, after the
     // loop's last drain, is answered in the same turn by running it again.

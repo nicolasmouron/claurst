@@ -207,6 +207,8 @@ impl AgentServer {
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
         let permission_manager = self.permission_manager_for(&runtime, &req.cwd);
         let state = SessionState::new(session_id.clone(), runtime, permission_manager);
+        *state.append_system_prompt.lock() =
+            crate::extensions::session_system_prompt(req.meta.as_ref());
         info!(session_id = %session_id, cwd = %req.cwd.display(), "ACP: new session");
 
         // v1: ignore req.mcp_servers — agent uses settings.json MCP roster.
@@ -277,6 +279,9 @@ impl AgentServer {
                 state
             }
         };
+        // The client restates its instructions on every load; none clears them.
+        *state.append_system_prompt.lock() =
+            crate::extensions::session_system_prompt(req.meta.as_ref());
 
         let messages = state.messages.lock().clone();
         crate::replay::replay(&self.connection, &state.session_id, &messages).await;

@@ -1091,3 +1091,23 @@ async fn queued_messages_can_be_taken_back_and_a_cancel_returns_the_rest() {
     assert_eq!(stop_reason(&response), acp::StopReason::Cancelled);
     assert_eq!(response["result"]["_meta"]["claurst"]["undeliveredMessages"], json!(["second"]));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_instructions_reach_the_system_prompt() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("session-prompt");
+    let provider = ScriptedProvider::new(vec![Step::Text("checked")]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    client.initialize_with_extensions().await;
+    let mut request = acp::NewSessionRequest::new(cwd.clone());
+    request.meta = json!({ "claurst": { "appendSystemPrompt": "Verify your work before you stop." } })
+        .as_object()
+        .cloned();
+    let response = client.call("session/new", request).await;
+    let session_id: acp::SessionId =
+        serde_json::from_value(response["result"]["sessionId"].clone()).expect("session id");
+
+    client.prompt(&session_id, "fix the button").await;
+    let system = serde_json::to_string(&provider.requests.lock()[0].system_prompt).unwrap();
+    assert!(system.contains("Verify your work before you stop."), "{system}");
+}

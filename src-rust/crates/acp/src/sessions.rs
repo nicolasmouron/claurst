@@ -40,6 +40,9 @@ pub struct SessionState {
     pub record: parking_lot::Mutex<ConversationSession>,
     /// Crash-safe writer for `record`: the query loop journals every step.
     pub journal: Arc<SessionJournal>,
+    /// Instructions the client added to the system prompt for this session
+    /// (`_meta.claurst.appendSystemPrompt` of `session/new` / `session/load`).
+    pub append_system_prompt: parking_lot::Mutex<Option<String>>,
 }
 
 impl SessionState {
@@ -78,6 +81,7 @@ impl SessionState {
             current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             record: parking_lot::Mutex::new(record),
             journal,
+            append_system_prompt: parking_lot::Mutex::new(None),
         })
     }
 

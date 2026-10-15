@@ -29,6 +29,11 @@
 //!
 //! Messages a cancelled turn never delivered come back in the prompt
 //! response, `_meta.claurst.undeliveredMessages`.
+//!
+//! `session/new` and `session/load` accept `_meta.claurst.appendSystemPrompt`:
+//! instructions added to the system prompt of that session, after the ones
+//! from the settings. `claurst acp` takes no command-line options, so this is
+//! how a client sets them per session.
 
 use agent_client_protocol_schema as acp;
 use claurst_query::{QueryEvent, TokenWarningState};
@@ -41,6 +46,13 @@ pub const SESSION_EVENT: &str = "_claurst/session_event";
 pub const QUEUE_MESSAGE: &str = "_claurst/queue_message";
 /// Request taking back a queued message not delivered yet.
 pub const UNQUEUE_MESSAGE: &str = "_claurst/unqueue_message";
+
+/// `_meta.claurst.appendSystemPrompt` of a `session/new` or `session/load`
+/// request, when it is a non-blank string.
+pub fn session_system_prompt(meta: Option<&acp::Meta>) -> Option<String> {
+    let text = meta?.get("claurst")?.get("appendSystemPrompt")?.as_str()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
 
 /// The extensions a client opted into.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
