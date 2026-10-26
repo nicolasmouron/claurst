@@ -1137,7 +1137,11 @@ pub mod config {
     // ---- Config ----------------------------------------------------------
 
     /// Top-level configuration values, merged from CLI args + settings file + env.
+    /// `#[serde(default)]`: a `config` section that sets only a few keys (a GUI that adds an MCP server or a
+    /// default model) keeps the defaults for the rest. Without it one missing key (`permission_mode`, `theme`, …)
+    /// made the whole settings file unreadable, and providers silently fell back to their built-in addresses.
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[serde(default)]
     pub struct Config {
         pub api_key: Option<String>,
         pub model: Option<String>,
@@ -2525,6 +2529,28 @@ pub mod config {
         use super::*;
 
         const MALFORMED_SETTINGS: &str = r#"{"config":{"model":"test-model",}}"#;
+
+        #[test]
+        fn partial_config_section_keeps_providers_and_defaults() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            std::fs::write(
+                &path,
+                r#"{"providers":{"custom-openai":{"api_base":"http://10.0.0.5:8080/v1","enabled":true}},
+                    "provider":"custom-openai",
+                    "config":{"mcp_servers":[{"name":"pixel","command":"node","args":["x.mjs"]}],"model":"custom-openai/m"}}"#,
+            )
+            .unwrap();
+
+            let settings = Settings::load_from_path_sync(&path).expect("a partial config section must load");
+
+            assert_eq!(
+                settings.providers["custom-openai"].api_base.as_deref(),
+                Some("http://10.0.0.5:8080/v1")
+            );
+            assert_eq!(settings.config.mcp_servers.len(), 1);
+            assert_eq!(settings.config.model.as_deref(), Some("custom-openai/m"));
+        }
 
         #[test]
         fn sync_load_reports_malformed_settings_without_modifying_them() {
