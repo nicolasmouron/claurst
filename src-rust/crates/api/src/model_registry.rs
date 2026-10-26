@@ -1278,6 +1278,14 @@ impl ModelRegistry {
     }
 }
 
+/// Add or remove image input in an entry's input modalities.
+fn set_image_input(input: &mut Vec<Modality>, vision: bool) {
+    input.retain(|m| *m != Modality::Image);
+    if vision {
+        input.push(Modality::Image);
+    }
+}
+
 /// Layer `overrides` onto `entries`: patch existing catalog rows in place and
 /// synthesize a minimal entry for any `"provider/model"` key the catalog lacks.
 /// Malformed keys (no `'/'`, or an empty half) and empty overrides are skipped.
@@ -1319,6 +1327,9 @@ fn apply_overrides_to_entries(
                     entry.status = model_status_from_str(st);
                     entry.info.status = Some(st.clone());
                 }
+                if let Some(vision) = ov.vision {
+                    set_image_input(&mut entry.modalities_input, vision);
+                }
             }
             None => {
                 // Materialise a synthetic entry for an id the catalog lacks.
@@ -1348,7 +1359,11 @@ fn apply_overrides_to_entries(
                     temperature: true,
                     attachment: false,
                     interleaved: None,
-                    modalities_input: vec![Modality::Text],
+                    modalities_input: {
+                        let mut input = vec![Modality::Text];
+                        set_image_input(&mut input, ov.vision.unwrap_or(false));
+                        input
+                    },
                     modalities_output: vec![Modality::Text],
                     cost_input: None,
                     cost_output: None,
@@ -2201,6 +2216,36 @@ mod tests {
             .list_by_provider("custom-openai")
             .iter()
             .any(|m| &*m.info.id == "my-local-llm"));
+    }
+
+    #[test]
+    fn override_vision_controls_image_input_of_synthetic_and_catalog_entries() {
+        // A model the catalog lacks, with only a context window: text-only, as before.
+        let mut reg = ModelRegistry::new();
+        reg.apply_model_overrides(&overrides(vec![(
+            "custom-openai/local-vl",
+            ModelOverride { context_window: Some(120_000), ..Default::default() },
+        )]));
+        assert!(!reg.get("custom-openai", "local-vl").unwrap().vision());
+
+        // The same model declared as reading images (the key may also be spelled `images`).
+        reg.apply_model_overrides(&overrides(vec![(
+            "custom-openai/local-vl",
+            ModelOverride { context_window: Some(120_000), vision: Some(true), ..Default::default() },
+        )]));
+        assert!(reg.get("custom-openai", "local-vl").unwrap().vision());
+        let parsed: ModelOverride = serde_json::from_str(r#"{"contextWindow":1000,"images":true}"#).unwrap();
+        assert_eq!(parsed.vision, Some(true));
+
+        // `vision: false` removes image input from a catalog entry that has it.
+        let id = reg.list_by_provider("anthropic").into_iter().find(|m| m.vision()).map(|m| m.info.id.to_string());
+        if let Some(id) = id {
+            reg.apply_model_overrides(&overrides(vec![(
+                &format!("anthropic/{id}"),
+                ModelOverride { vision: Some(false), ..Default::default() },
+            )]));
+            assert!(!reg.get("anthropic", &id).unwrap().vision());
+        }
     }
 
     #[test]

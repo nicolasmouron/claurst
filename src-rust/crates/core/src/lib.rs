@@ -1121,6 +1121,11 @@ pub mod config {
         /// Lifecycle status string (`"active"`, `"beta"`, …).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub status: Option<String>,
+        /// Whether the model accepts image input. `Some(true)` adds image input to the
+        /// catalog entry (or to the synthetic entry of a model the catalog lacks, which is
+        /// text-only otherwise), `Some(false)` removes it. `None` leaves it as is.
+        #[serde(default, alias = "images", alias = "imageInput", skip_serializing_if = "Option::is_none")]
+        pub vision: Option<bool>,
     }
 
     impl ModelOverride {
@@ -1131,6 +1136,7 @@ pub mod config {
                 && self.name.is_none()
                 && self.release_date.is_none()
                 && self.status.is_none()
+                && self.vision.is_none()
         }
     }
 
